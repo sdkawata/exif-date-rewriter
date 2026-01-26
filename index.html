@@ -4,7 +4,6 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>EXIF Date Rewriter</title>
-  <script src="https://cdn.jsdelivr.net/npm/piexifjs@1.0.6/piexif.min.js"></script>
   <style>
     * { box-sizing: border-box; }
     body {
@@ -96,33 +95,165 @@
   <div id="log"><span class="info">ログがここに表示されます</span></div>
 
   <script>
+    // EXIF解析・部分書き換えモジュール
+    const ExifDateRewriter = (() => {
+      const TAG_DATETIME_ORIGINAL = 0x9003;
+      const TAG_DATETIME_DIGITIZED = 0x9004;
+      const TAG_EXIF_IFD = 0x8769;
+
+      // バイト読み取りヘルパー
+      const readUint16 = (view, offset, littleEndian) => view.getUint16(offset, littleEndian);
+      const readUint32 = (view, offset, littleEndian) => view.getUint32(offset, littleEndian);
+
+      // JPEG内のAPP1(EXIF)セグメントを探す
+      const findApp1Segment = (view) => {
+        if (view.getUint16(0) !== 0xFFD8) return null; // Not JPEG
+
+        let offset = 2;
+        while (offset < view.byteLength - 4) {
+          const marker = view.getUint16(offset);
+          if (marker === 0xFFE1) { // APP1
+            const length = view.getUint16(offset + 2);
+            // Check "Exif\0\0"
+            if (view.getUint32(offset + 4) === 0x45786966 && view.getUint16(offset + 8) === 0x0000) {
+              return { offset: offset + 10, length: length - 8 }; // TIFFヘッダー開始位置
+            }
+          }
+          if ((marker & 0xFF00) !== 0xFF00) break;
+          const segmentLength = view.getUint16(offset + 2);
+          offset += 2 + segmentLength;
+        }
+        return null;
+      };
+
+      // IFDを解析してタグのオフセットを探す
+      const parseIFD = (view, tiffStart, ifdOffset, littleEndian, targetTags) => {
+        const results = {};
+        const entryCount = readUint16(view, tiffStart + ifdOffset, littleEndian);
+
+        for (let i = 0; i < entryCount; i++) {
+          const entryOffset = tiffStart + ifdOffset + 2 + i * 12;
+          const tag = readUint16(view, entryOffset, littleEndian);
+          const type = readUint16(view, entryOffset + 2, littleEndian);
+          const count = readUint32(view, entryOffset + 4, littleEndian);
+
+          if (targetTags.includes(tag)) {
+            // ASCII type (2), count includes null terminator
+            if (type === 2 && count === 20) {
+              const valueOffset = readUint32(view, entryOffset + 8, littleEndian);
+              results[tag] = tiffStart + valueOffset;
+            }
+          }
+        }
+
+        return results;
+      };
+
+      // ExifIFDへのポインタを取得
+      const findExifIFDPointer = (view, tiffStart, ifdOffset, littleEndian) => {
+        const entryCount = readUint16(view, tiffStart + ifdOffset, littleEndian);
+
+        for (let i = 0; i < entryCount; i++) {
+          const entryOffset = tiffStart + ifdOffset + 2 + i * 12;
+          const tag = readUint16(view, entryOffset, littleEndian);
+
+          if (tag === TAG_EXIF_IFD) {
+            return readUint32(view, entryOffset + 8, littleEndian);
+          }
+        }
+        return null;
+      };
+
+      // DateTimeOriginal/Digitizedのファイル内オフセットを探す
+      const findDateTimeOffsets = (buffer) => {
+        const view = new DataView(buffer);
+
+        const app1 = findApp1Segment(view);
+        if (!app1) return null;
+
+        const tiffStart = app1.offset;
+
+        // バイトオーダー確認
+        const byteOrder = view.getUint16(tiffStart);
+        const littleEndian = byteOrder === 0x4949; // "II"
+        if (!littleEndian && byteOrder !== 0x4D4D) return null; // Not "MM" either
+
+        // TIFF magic number check
+        if (readUint16(view, tiffStart + 2, littleEndian) !== 0x002A) return null;
+
+        // IFD0 offset
+        const ifd0Offset = readUint32(view, tiffStart + 4, littleEndian);
+
+        // Find ExifIFD pointer in IFD0
+        const exifIFDOffset = findExifIFDPointer(view, tiffStart, ifd0Offset, littleEndian);
+        if (!exifIFDOffset) return null;
+
+        // Parse ExifIFD for DateTimeOriginal and DateTimeDigitized
+        const offsets = parseIFD(view, tiffStart, exifIFDOffset, littleEndian, [
+          TAG_DATETIME_ORIGINAL,
+          TAG_DATETIME_DIGITIZED
+        ]);
+
+        // 現在の値を読み取る
+        const readDateString = (offset) => {
+          const bytes = new Uint8Array(buffer, offset, 19);
+          return new TextDecoder('ascii').decode(bytes);
+        };
+
+        const result = { offsets: [], oldDates: [] };
+
+        if (offsets[TAG_DATETIME_ORIGINAL]) {
+          result.offsets.push(offsets[TAG_DATETIME_ORIGINAL]);
+          result.oldDates.push(readDateString(offsets[TAG_DATETIME_ORIGINAL]));
+        }
+        if (offsets[TAG_DATETIME_DIGITIZED]) {
+          result.offsets.push(offsets[TAG_DATETIME_DIGITIZED]);
+        }
+
+        return result.offsets.length > 0 ? result : null;
+      };
+
+      return { findDateTimeOffsets };
+    })();
+
+    // UI
     const logEl = document.getElementById('log');
-    const log = (msg, type = '') => {
-      const span = document.createElement('span');
-      span.className = type;
-      span.textContent = msg;
-      logEl.appendChild(span);
-      logEl.appendChild(document.createElement('br'));
+    const logQueue = [];
+    let logFlushTimer = null;
+
+    const flushLog = () => {
+      if (logQueue.length === 0) return;
+      const frag = document.createDocumentFragment();
+      for (const [msg, type] of logQueue) {
+        const span = document.createElement('span');
+        span.className = type;
+        span.textContent = msg;
+        frag.appendChild(span);
+        frag.appendChild(document.createElement('br'));
+      }
+      logEl.appendChild(frag);
       logEl.scrollTop = logEl.scrollHeight;
+      logQueue.length = 0;
+    };
+
+    const log = (msg, type = '') => {
+      logQueue.push([msg, type]);
+      if (!logFlushTimer) {
+        logFlushTimer = setInterval(flushLog, 50);
+      }
     };
 
     const clearLog = () => {
+      logQueue.length = 0;
       logEl.innerHTML = '';
     };
 
-    const fileToDataURL = (file) => new Promise(resolve => {
-      const reader = new FileReader();
-      reader.onload = e => resolve(e.target.result);
-      reader.readAsDataURL(file);
-    });
-
-    const dataURLtoBlob = (dataUrl) => {
-      const [header, base64] = dataUrl.split(',');
-      const mime = header.match(/:(.*?);/)[1];
-      const binary = atob(base64);
-      const array = new Uint8Array(binary.length);
-      for (let i = 0; i < binary.length; i++) array[i] = binary.charCodeAt(i);
-      return new Blob([array], { type: mime });
+    const stopLogFlush = () => {
+      flushLog();
+      if (logFlushTimer) {
+        clearInterval(logFlushTimer);
+        logFlushTimer = null;
+      }
     };
 
     const formatExifDate = (date) => {
@@ -135,6 +266,8 @@
     const dropzone = document.getElementById('dropzone');
     let isProcessing = false;
 
+    const CONCURRENCY = 10;
+
     const processDirectoryHandle = async (dirHandle) => {
       const dateInput = document.getElementById('newDate').value;
       if (!dateInput) {
@@ -146,6 +279,8 @@
       isProcessing = true;
 
       const exifDate = formatExifDate(dateInput);
+      const exifDateBytes = new TextEncoder().encode(exifDate);
+
       clearLog();
       log(`設定する日時: ${exifDate}`, 'info');
 
@@ -153,49 +288,85 @@
       btn.textContent = '処理中...';
       dropzone.textContent = '処理中...';
 
+      const startTime = performance.now();
+
       try {
         let processed = 0;
+        let skipped = 0;
         let failed = 0;
 
-        const processDirectory = async (dirHandle, path = '') => {
+        // ファイルを全て収集
+        const files = [];
+        const collectFiles = async (dirHandle, path = '') => {
           for await (const entry of dirHandle.values()) {
             const entryPath = path ? `${path}/${entry.name}` : entry.name;
-
             if (entry.kind === 'directory') {
-              await processDirectory(entry, entryPath);
+              await collectFiles(entry, entryPath);
             } else if (entry.kind === 'file' && /\.jpe?g$/i.test(entry.name)) {
-              try {
-                const file = await entry.getFile();
-                const dataUrl = await fileToDataURL(file);
-
-                const exifObj = piexif.load(dataUrl);
-                const oldDate = exifObj.Exif[piexif.ExifIFD.DateTimeOriginal] || '(なし)';
-                exifObj.Exif[piexif.ExifIFD.DateTimeOriginal] = exifDate;
-                exifObj.Exif[piexif.ExifIFD.DateTimeDigitized] = exifDate;
-
-                const exifBytes = piexif.dump(exifObj);
-                const newDataUrl = piexif.insert(exifBytes, dataUrl);
-
-                const writable = await entry.createWritable();
-                await writable.write(dataURLtoBlob(newDataUrl));
-                await writable.close();
-
-                processed++;
-                log(`✓ ${entryPath}: ${oldDate} → ${exifDate}`, 'success');
-              } catch (e) {
-                failed++;
-                log(`✗ ${entryPath}: ${e.message}`, 'error');
-              }
+              files.push({ entry, path: entryPath });
             }
           }
         };
+        await collectFiles(dirHandle);
+        log(`対象ファイル: ${files.length}件`, 'info');
 
-        await processDirectory(dirHandle);
+        // 並列処理用セマフォ
+        const semaphore = {
+          count: CONCURRENCY,
+          queue: [],
+          acquire() {
+            return new Promise(resolve => {
+              if (this.count > 0) { this.count--; resolve(); }
+              else { this.queue.push(resolve); }
+            });
+          },
+          release() {
+            if (this.queue.length > 0) { this.queue.shift()(); }
+            else { this.count++; }
+          }
+        };
 
-        log(`完了: ${processed}件成功, ${failed}件失敗`, 'info');
+        const HEADER_SIZE = 65536; // 64KB
+
+        const processFile = async ({ entry, path: entryPath }) => {
+          await semaphore.acquire();
+          try {
+            const file = await entry.getFile();
+            const headerBuffer = await file.slice(0, HEADER_SIZE).arrayBuffer();
+            const result = ExifDateRewriter.findDateTimeOffsets(headerBuffer);
+
+            if (!result || result.offsets.length === 0) {
+              skipped++;
+              log(`- ${entryPath}: EXIFなし`, 'info');
+              return;
+            }
+
+            const oldDate = result.oldDates[0] || '(不明)';
+            const writable = await entry.createWritable({ keepExistingData: true });
+            for (const offset of result.offsets) {
+              await writable.seek(offset);
+              await writable.write(exifDateBytes);
+            }
+            await writable.close();
+
+            processed++;
+            log(`✓ ${entryPath}: ${oldDate} → ${exifDate}`, 'success');
+          } catch (e) {
+            failed++;
+            log(`✗ ${entryPath}: ${e.message}`, 'error');
+          } finally {
+            semaphore.release();
+          }
+        };
+
+        await Promise.all(files.map(processFile));
+
+        const elapsed = ((performance.now() - startTime) / 1000).toFixed(2);
+        log(`完了: ${processed}件成功, ${skipped}件スキップ, ${failed}件失敗 (${elapsed}秒)`, 'info');
       } catch (e) {
         log(`エラー: ${e.message}`, 'error');
       } finally {
+        stopLogFlush();
         isProcessing = false;
         btn.disabled = false;
         btn.textContent = 'ディレクトリを選択して実行';
