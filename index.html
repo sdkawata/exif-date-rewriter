@@ -88,6 +88,13 @@
     <input type="datetime-local" id="newDate">
   </div>
 
+  <div class="form-group">
+    <label>
+      <input type="checkbox" id="incrementTime">
+      写真ごとに1秒ずつ時刻を進める
+    </label>
+  </div>
+
   <button id="selectDir">ディレクトリを選択して実行</button>
 
   <div id="dropzone">または、ここにフォルダをドラッグ＆ドロップ</div>
@@ -278,11 +285,11 @@
       if (isProcessing) return;
       isProcessing = true;
 
-      const exifDate = formatExifDate(dateInput);
-      const exifDateBytes = new TextEncoder().encode(exifDate);
+      const incrementTime = document.getElementById('incrementTime').checked;
+      const baseDate = new Date(dateInput);
 
       clearLog();
-      log(`設定する日時: ${exifDate}`, 'info');
+      log(`設定する日時: ${formatExifDate(dateInput)}${incrementTime ? ' (+1秒ずつ)' : ''}`, 'info');
 
       btn.disabled = true;
       btn.textContent = '処理中...';
@@ -308,6 +315,8 @@
           }
         };
         await collectFiles(dirHandle);
+        // ファイル名順にソート（時刻増分時の順序を安定させる）
+        files.sort((a, b) => a.path.localeCompare(b.path));
         log(`対象ファイル: ${files.length}件`, 'info');
 
         // 並列処理用セマフォ
@@ -328,7 +337,7 @@
 
         const HEADER_SIZE = 65536; // 64KB
 
-        const processFile = async ({ entry, path: entryPath }) => {
+        const processFile = async ({ entry, path: entryPath }, index) => {
           await semaphore.acquire();
           try {
             const file = await entry.getFile();
@@ -340,6 +349,11 @@
               log(`- ${entryPath}: EXIFなし`, 'info');
               return;
             }
+
+            // 時刻を計算（インクリメントオンなら1秒ずつ加算）
+            const targetDate = new Date(baseDate.getTime() + (incrementTime ? index * 1000 : 0));
+            const exifDate = formatExifDate(targetDate);
+            const exifDateBytes = new TextEncoder().encode(exifDate);
 
             const oldDate = result.oldDates[0] || '(不明)';
             const writable = await entry.createWritable({ keepExistingData: true });
@@ -359,7 +373,7 @@
           }
         };
 
-        await Promise.all(files.map(processFile));
+        await Promise.all(files.map((file, index) => processFile(file, index)));
 
         const elapsed = ((performance.now() - startTime) / 1000).toFixed(2);
         log(`完了: ${processed}件成功, ${skipped}件スキップ, ${failed}件失敗 (${elapsed}秒)`, 'info');
